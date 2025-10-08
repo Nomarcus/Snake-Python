@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pygame
@@ -58,6 +58,14 @@ class SnakeEnv(Env):
     ACTION_NAMES = {0: "UP", 1: "RIGHT", 2: "DOWN", 3: "LEFT"}
 
     START_PATTERNS: Sequence[str] = ("line", "cube", "spiral", "random")
+    REWARD_COMPONENTS: Tuple[str, ...] = (
+        "fruit_reward",
+        "step_penalty",
+        "death_penalty",
+        "loop_penalty",
+        "compact_bonus",
+        "wall_penalty",
+    )
 
     def __init__(
         self,
@@ -95,6 +103,13 @@ class SnakeEnv(Env):
         self.fruits_eaten: int = 0
         self.loop_history: Deque[Action] = deque(maxlen=12)
         self.episode_reward: float = 0.0
+        self._reward_component_keys: Tuple[str, ...] = self.REWARD_COMPONENTS
+        self.reward_breakdown: Dict[str, float] = {
+            key: 0.0 for key in self._reward_component_keys
+        }
+        self.last_reward_components: Dict[str, float] = {
+            key: 0.0 for key in self._reward_component_keys
+        }
 
         self._init_pygame_if_needed()
 
@@ -124,6 +139,9 @@ class SnakeEnv(Env):
         self.loop_history.clear()
         self.pending_growth = 0
         self.episode_reward = 0.0
+        for key in self._reward_component_keys:
+            self.reward_breakdown[key] = 0.0
+            self.last_reward_components[key] = 0.0
         self._spawn_snake(options or {})
         self._spawn_fruit()
         observation = self._get_observation()
@@ -135,9 +153,13 @@ class SnakeEnv(Env):
 
     def step(self, action: Action):
         assert self.action_space.contains(action)
-        reward = self.reward_cfg.step_penalty
+        reward = 0.0
         terminated = False
         truncated = False
+        components = {key: 0.0 for key in self._reward_component_keys}
+
+        components["step_penalty"] += self.reward_cfg.step_penalty
+        reward += self.reward_cfg.step_penalty
 
         if self._is_opposite_direction(action):
             action = self.direction
@@ -150,11 +172,14 @@ class SnakeEnv(Env):
 
         # Wall detection – grant penalty and end episode just like HTML.
         if not self._within_bounds(new_head):
+            components["wall_penalty"] += self.reward_cfg.wall_penalty
+            components["death_penalty"] += self.reward_cfg.death_penalty
             reward += self.reward_cfg.wall_penalty
             reward += self.reward_cfg.death_penalty
             terminated = True
         else:
             if new_head in self.snake:
+                components["death_penalty"] += self.reward_cfg.death_penalty
                 reward += self.reward_cfg.death_penalty
                 terminated = True
             else:
@@ -162,6 +187,7 @@ class SnakeEnv(Env):
                 if new_head == self.fruit:
                     self.pending_growth += 1
                     self.fruits_eaten += 1
+                    components["fruit_reward"] += self.reward_cfg.fruit_reward
                     reward += self.reward_cfg.fruit_reward
                     self._spawn_fruit()
                 if self.pending_growth > 0:
@@ -172,14 +198,20 @@ class SnakeEnv(Env):
         self.steps_since_reset += 1
 
         if terminated:
+            self._accumulate_reward_components(components)
             self.episode_reward += reward
             observation = self._get_observation()
             info = self._build_info(done=True)
             return observation, reward, terminated, truncated, info
 
-        reward += self._loop_penalty()
-        reward += self._compactness_bonus()
+        loop_penalty = self._loop_penalty()
+        compact_bonus = self._compactness_bonus()
+        components["loop_penalty"] += loop_penalty
+        components["compact_bonus"] += compact_bonus
+        reward += loop_penalty
+        reward += compact_bonus
 
+        self._accumulate_reward_components(components)
         self.episode_reward += reward
         observation = self._get_observation()
         info = self._build_info(done=False)
@@ -411,13 +443,20 @@ class SnakeEnv(Env):
             "fruits": self.fruits_eaten,
             "steps": self.steps_since_reset,
             "pattern": self.start_pattern,
+            "step_reward_components": dict(self.last_reward_components),
         }
         if done:
+            info["reward_breakdown"] = dict(self.reward_breakdown)
             info["episode"] = {
                 "r": float(self.episode_reward),
                 "l": self.steps_since_reset,
             }
         return info
+
+    def _accumulate_reward_components(self, components: Dict[str, float]) -> None:
+        for key, value in components.items():
+            self.reward_breakdown[key] += value
+            self.last_reward_components[key] = value
 
 
 __all__ = ["SnakeEnv", "RewardConfig"]
