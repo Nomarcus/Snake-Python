@@ -12,6 +12,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv
 from stable_baselines3.common.vec_env.util import make_vec_env
 
 from snake_env import SnakeEnv
+from utils.reward_telemetry import RewardTelemetryTracker, WINDOW_SIZES
 
 ANSI_GREEN = "\033[92m"
 ANSI_YELLOW = "\033[93m"
@@ -28,6 +29,8 @@ class EpisodeTracker(BaseCallback):
         self.lengths: list[int] = []
         self.fruits: list[int] = []
         self.last_log = 0
+        self.reward_tracker = RewardTelemetryTracker(SnakeEnv.REWARD_COMPONENTS)
+        self._have_reward_data = False
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
@@ -44,6 +47,9 @@ class EpisodeTracker(BaseCallback):
                     f"{colour}Episode | Reward: {info['episode']['r']:.2f} | "
                     f"Length: {info['episode']['l']} | Fruits: {info.get('fruits', 0)}{ANSI_RESET}"
                 )
+            if "reward_breakdown" in info:
+                self.reward_tracker.update(info["reward_breakdown"])
+                self._have_reward_data = True
 
         if self.num_timesteps - self.last_log >= self.log_interval:
             self.last_log = self.num_timesteps
@@ -58,7 +64,30 @@ class EpisodeTracker(BaseCallback):
                     f"{ANSI_GREEN}Step {self.num_timesteps:,} | Avg Reward (20 ep): {avg_r:.2f} | "
                     f"Avg Len: {avg_l:.1f} | Avg Fruits: {avg_f:.2f}{ANSI_RESET}"
                 )
+            if self._have_reward_data:
+                self._log_reward_components()
         return True
+
+    def _log_reward_components(self) -> None:
+        stats = self.reward_tracker.stats()
+        print(self.reward_tracker.format_table())
+        for component, component_stats in stats.items():
+            self._record_if_finite(
+                f"snake/reward_components/{component}/last", component_stats["last"]
+            )
+            for window_size in WINDOW_SIZES:
+                key = f"avg_{window_size}"
+                self._record_if_finite(
+                    f"snake/reward_components/{component}/{key}", component_stats[key]
+                )
+            self._record_if_finite(
+                f"snake/reward_components/{component}/std", component_stats["std"]
+            )
+
+    def _record_if_finite(self, key: str, value: float) -> None:
+        if np.isnan(value):
+            return
+        self.logger.record(key, value)
 
 
 def parse_args() -> argparse.Namespace:

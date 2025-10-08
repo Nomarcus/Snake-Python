@@ -5,13 +5,13 @@ from __future__ import annotations
 import argparse
 import math
 import random
-import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from pathlib import Path
-from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple
+import sys
+from typing import Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 try:  # NumPy krävs för Double DQN-implementationen
     import numpy as np
@@ -23,6 +23,14 @@ except ModuleNotFoundError as exc:  # pragma: no cover - tydligare fel i IDLE
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+if __package__ in (None, ""):
+    project_root = Path(__file__).resolve().parent.parent
+    project_root_str = str(project_root)
+    if project_root_str not in sys.path:
+        sys.path.insert(0, project_root_str)
+
+from snakepython.utils.reward_telemetry import RewardTelemetryTracker
 
 # ---------------------------------------------------------------------------
 # Game configuration
@@ -74,6 +82,28 @@ REWARD_BREAKDOWN_KEYS: Tuple[str, ...] = (
     "selfPenalty",
     "timeoutPenalty",
 )
+
+TELEMETRY_COMPONENTS: Tuple[str, ...] = ("total",) + REWARD_BREAKDOWN_KEYS
+
+COMPONENT_LABELS: Dict[str, str] = {
+    "total": "Totalt",
+    "stepPenalty": "Stegstraff",
+    "turnPenalty": "Svängstraff",
+    "approachBonus": "Närmande bonus",
+    "retreatPenalty": "Retreatstraff",
+    "loopPenalty": "Loopstraff",
+    "tightLoopPenalty": "Tät loop straff",
+    "revisitPenalty": "Återbesök",
+    "deadEndPenalty": "Återvändsgränd",
+    "trapPenalty": "Fällestraff",
+    "spaceGainBonus": "Utrymmesbonus",
+    "fruitReward": "Fruktbelöning",
+    "growthBonus": "Tillväxtbonus",
+    "compactness": "Kompakthet",
+    "wallPenalty": "Väggstraff",
+    "selfPenalty": "Självstraff",
+    "timeoutPenalty": "Timeout",
+}
 
 VISIT_DECAY = 0.995
 LOOP_PATTERNS = {(1, 2, 1, 2), (2, 1, 2, 1)}
@@ -391,6 +421,7 @@ class IdleSnakeEnv:
         self.steps_taken = 0
         self.fruits_eaten = 0
         self.reward_breakdown = self._make_reward_breakdown()
+        self.last_step_breakdown = self._make_reward_breakdown()
 
     @property
     def state_size(self) -> int:
@@ -468,6 +499,7 @@ class IdleSnakeEnv:
         self.visit_map = [[0.0 for _ in range(self.grid_size)] for _ in range(self.grid_size)]
         self.episode_breakdown = self._make_reward_breakdown()
         self.reward_breakdown = self._make_reward_breakdown()
+        self.last_step_breakdown = self._make_reward_breakdown()
         self._spawn_fruit()
         self.state = build_state_vector(self.snake, self.fruit, self.direction_index, self.grid_size)
         return self.state.copy()
@@ -648,7 +680,8 @@ class IdleSnakeEnv:
                 continue
             self.episode_breakdown[key] += value
         self.episode_breakdown["total"] += reward
-        self.reward_breakdown = {key: (self.episode_breakdown[key] if key != "total" else self.episode_breakdown["total"]) for key in self.episode_breakdown}
+        self.reward_breakdown = {key: float(value) for key, value in self.episode_breakdown.items()}
+        self.last_step_breakdown = {key: float(value) for key, value in step_breakdown.items()}
 
         if not done:
             next_state = build_state_vector(self.snake, self.fruit, self.direction_index, self.grid_size)
@@ -656,11 +689,17 @@ class IdleSnakeEnv:
         else:
             next_state = self.state.copy()
 
+        step_info = dict(step_breakdown)
+        cumulative_info = dict(self.reward_breakdown)
         info: Dict[str, object] = {
             "cause": cause,
-            "breakdown": step_breakdown,
+            "breakdown": step_info,
+            "step_breakdown": dict(step_info),
+            "reward_breakdown": cumulative_info,
+            "episode_breakdown": dict(cumulative_info),
             "fruits": self.fruits_eaten,
             "steps": self.steps_taken,
+            "total_reward": self.total_reward,
         }
         return next_state, reward, done, info
 
@@ -684,39 +723,142 @@ class IdleSnakeEnv:
         }
 
 
-# ---------------------------------------------------------------------------
-# Tkinter score tracking and rendering
-# ---------------------------------------------------------------------------
+class RewardTelemetryPanel(tk.Frame):
+    """Side panel that renders per-komponent belöningsstatistik."""
 
+    def __init__(self, master: tk.Misc, components: Sequence[str] = TELEMETRY_COMPONENTS) -> None:
+        super().__init__(master, bg="#101010", highlightthickness=0, bd=0, padx=12, pady=12)
+        self.components: Tuple[str, ...] = tuple(components)
+        self.tracker = RewardTelemetryTracker(self.components)
 
-@dataclass
-class Score:
-    reward_config: RewardConfig = field(default_factory=RewardConfig)
-    fruits: int = 0
-    steps: int = 0
-    reward: float = 0.0
+        heading = tk.Label(
+            self,
+            text="Belöningsstatistik",
+            font=("Segoe UI Semibold", 14),
+            fg="#f5f5f5",
+            bg="#101010",
+            anchor="w",
+        )
+        heading.pack(fill="x", pady=(0, 6))
 
-    def reset(self) -> None:
-        self.fruits = 0
-        self.steps = 0
-        self.reward = 0.0
+        self.last_label = tk.Label(
+            self,
+            text="",
+            font=("Consolas", 11),
+            justify="left",
+            fg="#e0e0e0",
+            bg="#101010",
+            anchor="w",
+        )
+        self.last_label.pack(fill="x", pady=(4, 8))
 
-    def apply_step(self, outcome: str) -> None:
-        self.steps += 1
-        self.reward -= self.reward_config.step_penalty
-        if outcome == "fruit":
-            self.fruits += 1
-            self.reward += self.reward_config.fruit_reward
-        elif outcome == "wall":
-            self.reward -= self.reward_config.wall_penalty
-        elif outcome == "self":
-            self.reward -= self.reward_config.self_penalty
+        self.total_label = tk.Label(
+            self,
+            text="",
+            font=("Consolas", 11),
+            justify="left",
+            fg="#e0e0e0",
+            bg="#101010",
+            anchor="w",
+        )
+        self.total_label.pack(fill="x", pady=(0, 12))
+
+        self.trend_label = tk.Label(
+            self,
+            text="",
+            font=("Consolas", 10),
+            justify="left",
+            fg="#c8c8c8",
+            bg="#101010",
+            anchor="w",
+        )
+        self.trend_label.pack(fill="both", expand=True)
+
+        self.start_episode()
+
+    def start_episode(self) -> None:
+        empty = {component: 0.0 for component in self.components}
+        self._render_last(empty)
+        self._render_totals(empty)
+        self._render_trends()
+
+    def reset_history(self) -> None:
+        """Clear rolling statistik while behålla visningen."""
+
+        self.tracker = RewardTelemetryTracker(self.components)
+        self._render_trends()
+
+    def update(
+        self,
+        step_breakdown: Mapping[str, float],
+        episode_breakdown: Mapping[str, float],
+    ) -> None:
+        trimmed_step = {component: float(step_breakdown.get(component, 0.0)) for component in self.components}
+        trimmed_totals = {component: float(episode_breakdown.get(component, 0.0)) for component in self.components}
+        self.tracker.update(trimmed_step)
+        self._render_last(trimmed_step)
+        self._render_totals(trimmed_totals)
+        self._render_trends()
+
+    def _render_last(self, breakdown: Mapping[str, float]) -> None:
+        lines = ["Senaste steg:"]
+        for component in self.components:
+            lines.append(self._format_component_line(component, breakdown.get(component, 0.0)))
+        self.last_label.configure(text="\n".join(lines))
+
+    def _render_totals(self, totals: Mapping[str, float]) -> None:
+        lines = ["Ackumulerat:"]
+        for component in self.components:
+            lines.append(self._format_component_line(component, totals.get(component, 0.0)))
+        self.total_label.configure(text="\n".join(lines))
+
+    def _render_trends(self) -> None:
+        stats = self.tracker.stats()
+        header = "Komponent          Senast  Snitt10 Snitt100 Snitt1000     Std"
+        lines = ["Trender:", header, "-" * len(header)]
+        for component in self.components:
+            comp_stats = stats.get(component, {})
+            line = (
+                f"{self._label(component):<18}"
+                f"{self._format_value(comp_stats.get('last')):>8}"
+                f"{self._format_value(comp_stats.get('avg_10')):>8}"
+                f"{self._format_value(comp_stats.get('avg_100')):>9}"
+                f"{self._format_value(comp_stats.get('avg_1000')):>10}"
+                f"{self._format_value(comp_stats.get('std')):>9}"
+            )
+            lines.append(line)
+        self.trend_label.configure(text="\n".join(lines))
+
+    def _label(self, component: str) -> str:
+        return COMPONENT_LABELS.get(component, component.replace("_", " ").title())
+
+    def _format_component_line(self, component: str, value: float) -> str:
+        return f"{self._label(component):<18}{self._format_signed(value):>9}"
+
+    @staticmethod
+    def _format_signed(value: float) -> str:
+        if abs(value) < 1e-6:
+            return "   0.00"
+        return f"{value:+7.2f}"
+
+    @staticmethod
+    def _format_value(value: Optional[float]) -> str:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return "    -"
+        return f"{value:7.2f}"
 
 
 class SnakeCanvas(tk.Canvas):
     """Canvas widget that hosts the actual snake game."""
 
-    def __init__(self, master: tk.Misc, status: tk.Label, agent: Optional[DoubleDQNAgent] = None, autopilot: bool = False) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        status: tk.Label,
+        telemetry: RewardTelemetryPanel,
+        agent: Optional[DoubleDQNAgent] = None,
+        autopilot: bool = False,
+    ) -> None:
         pixel_size = GRID_SIZE * CELL_SIZE
         super().__init__(
             master,
@@ -727,35 +869,31 @@ class SnakeCanvas(tk.Canvas):
         )
         self.pack()
         self.status_label = status
-        self.score = Score()
-        self._running = False
-        self._after_id: Optional[str] = None
+        self.telemetry = telemetry
         self.agent = agent
         self.autopilot = autopilot and agent is not None
+        self.env = IdleSnakeEnv(grid_size=GRID_SIZE)
+        self._running = False
+        self._after_id: Optional[str] = None
+        self.direction: Direction = ACTION_VECTORS[1]
+        self.snake: List[Point] = []
+        self.fruit: Point = (0, 0)
         self.reset()
         self.focus_set()
         self.bind("<KeyPress>", self.on_key_press)
 
     def reset(self) -> None:
-        self.delete("all")
-        start_x = GRID_SIZE // 2
-        start_y = GRID_SIZE // 2
-        self.snake = [(start_x - i, start_y) for i in range(START_LENGTH)]
-        self.direction = (1, 0)
-        self.score.reset()
+        if self._after_id is not None:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self.env.reset()
+        self.snake = list(self.env.snake)
+        self.fruit = self.env.fruit
+        self.direction = ACTION_VECTORS[self.env.direction_index]
         self._running = True
-        self.spawn_fruit()
+        self.telemetry.start_episode()
         self.draw_frame()
         self.update_status("start")
-
-    def spawn_fruit(self) -> None:
-        free_cells = [
-            (x, y)
-            for x in range(GRID_SIZE)
-            for y in range(GRID_SIZE)
-            if (x, y) not in self.snake
-        ]
-        self.fruit = random.choice(free_cells) if free_cells else self.snake[0]
 
     # Input handling -----------------------------------------------------
     def on_key_press(self, event: tk.Event[tk.Misc]) -> None:
@@ -837,20 +975,26 @@ class SnakeCanvas(tk.Canvas):
         if not self._running:
             return
         if self.autopilot and self.agent is not None:
-            direction_idx = DIRECTION_TO_INDEX[self.direction]
-            state = build_state_vector(self.snake, self.fruit, direction_idx, GRID_SIZE)
-            action = self.agent.select_action(state, greedy=True)
-            chosen_direction = ACTION_VECTORS[action]
-            if OPPOSITE[self.direction] != chosen_direction:
-                self.direction = chosen_direction
-        outcome = self.advance_snake()
+            action = self.agent.select_action(self.env.state.copy(), greedy=True)
+        else:
+            action = DIRECTION_TO_INDEX[self.direction]
+
+        next_state, _, done, info = self.env.step(action)
+        self.snake = list(self.env.snake)
+        self.fruit = self.env.fruit
+        self.direction = ACTION_VECTORS[self.env.direction_index]
         self.draw_frame()
-        self.score.apply_step(outcome)
-        self.update_status(outcome)
-        if outcome in {"wall", "self"}:
+
+        step_breakdown = info.get("step_breakdown") or dict(self.env.last_step_breakdown)
+        totals = info.get("reward_breakdown") or dict(self.env.reward_breakdown)
+        self.telemetry.update(step_breakdown, totals)
+
+        cause = info.get("cause", "step")
+        self.update_status(cause, finished=done)
+        if done:
             self._running = False
-            self.update_status(outcome, finished=True)
             return
+        self.env.state = next_state
         self._after_id = self.after(STEP_DELAY, self.tick)
 
     def update_status(self, outcome: str, finished: bool = False) -> None:
@@ -860,6 +1004,8 @@ class SnakeCanvas(tk.Canvas):
             prefix = "💥 Krockade med väggen."
         elif outcome == "self":
             prefix = "💥 Åt sig själv."
+        elif outcome == "timeout":
+            prefix = "⏱️ Timeout."
         elif outcome == "start":
             prefix = "🐍 Nystart."
         else:
@@ -868,27 +1014,10 @@ class SnakeCanvas(tk.Canvas):
         autopilot_text = " 🤖" if self.autopilot and self.agent is not None else ""
         self.status_label.configure(
             text=(
-                f"{prefix}{autopilot_text} Poäng: {self.score.reward:.0f}  "
-                f"Frukter: {self.score.fruits}  Steg: {self.score.steps}.{suffix}"
+                f"{prefix}{autopilot_text} Poäng: {self.env.total_reward:.1f}  "
+                f"Frukter: {self.env.fruits_eaten}  Steg: {self.env.steps_taken}.{suffix}"
             )
         )
-
-    def advance_snake(self) -> str:
-        head_x, head_y = self.snake[0]
-        dx, dy = self.direction
-        new_head = (head_x + dx, head_y + dy)
-
-        if not (0 <= new_head[0] < GRID_SIZE and 0 <= new_head[1] < GRID_SIZE):
-            return "wall"
-        if new_head in self.snake:
-            return "self"
-
-        self.snake.insert(0, new_head)
-        if new_head == self.fruit:
-            self.spawn_fruit()
-            return "fruit"
-        self.snake.pop()
-        return "step"
 
 
 class TrainingViewer:
@@ -2087,8 +2216,16 @@ def start_game(agent: Optional[DoubleDQNAgent] = None, autopilot: bool = False) 
     )
     status.pack(fill="x")
 
-    canvas = SnakeCanvas(root, status, agent=agent, autopilot=autopilot)
-    canvas.pack()
+    body = tk.Frame(root, bg="#101010")
+    body.pack(fill="both", expand=True)
+
+    canvas_holder = tk.Frame(body, bg="#101010")
+    canvas_holder.pack(side="left", padx=(12, 6), pady=(0, 12))
+
+    telemetry_panel = RewardTelemetryPanel(body)
+    telemetry_panel.pack(side="right", fill="y", padx=(6, 12), pady=(0, 12))
+
+    canvas = SnakeCanvas(canvas_holder, status, telemetry_panel, agent=agent, autopilot=autopilot)
     canvas.start()
 
     root.mainloop()
