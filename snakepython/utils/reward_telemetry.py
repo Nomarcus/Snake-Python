@@ -59,12 +59,11 @@ class RewardTelemetryTracker:
     def format_table(self) -> str:
         stats = self.stats()
         header = "Component        Last    Avg10    Avg100   Avg1000     Std"
-        divider = "-" * len(header)
-        lines = ["Reward component trends:", header, divider]
+        lines = ["Reward component trends:", header]
         for component in self.components:
             comp_stats = stats[component]
             line = (
-                f"{self._format_component_label(component):15s}"
+                f"{component:15s}"
                 f" {self._format_value(comp_stats['last']):>7}"
                 f" {self._format_value(comp_stats['avg_10']):>8}"
                 f" {self._format_value(comp_stats['avg_100']):>8}"
@@ -79,10 +78,6 @@ class RewardTelemetryTracker:
         if math.isnan(value):
             return "   -"
         return f"{value:6.2f}"
-
-    @staticmethod
-    def _format_component_label(component: str) -> str:
-        return component.replace("_", " ").title()
 
 
 __all__ = ["RewardTelemetryTracker", "WINDOW_SIZES"]
