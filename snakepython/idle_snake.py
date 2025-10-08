@@ -8,7 +8,7 @@ import random
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from functools import partial
 from pathlib import Path
 from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple
@@ -1108,13 +1108,18 @@ class IdleTrainerApp:
         self.env = IdleSnakeEnv()
         self.stats = TrainingStats()
         self.training_active = False
+        self.evaluation_active = False
         self.last_reward: float = 0.0
         self.last_loss: Optional[float] = None
+        self.last_evaluation_reward: float = 0.0
+        self.evaluation_episodes: int = 0
         self.current_state: Optional[np.ndarray] = None
         self.current_episode_reward: float = 0.0
         self.current_episode_steps: int = 0
         self._syncing_params = False
+        self._syncing_rewards = False
         self._pending_message: Optional[str] = None
+        self._last_mode: str = "idle"
 
         self.agent = self._load_initial_agent(load_path)
 
@@ -1125,13 +1130,15 @@ class IdleTrainerApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
-        self._reset_episode()
         self._sync_param_entries_from_agent()
+        self._sync_reward_sliders_from_env()
+        self._reset_episode()
         if self._pending_message:
             self._log_message(self._pending_message)
         else:
             self._log_message("Klar att starta träning.")
-        self.root.after(50, self._training_loop)
+        _, initial_delay = self._compute_update_schedule()
+        self.root.after(initial_delay, self._update_loop)
 
     def _load_initial_agent(self, load_path: Optional[Path | str]) -> DoubleDQNAgent:
         if load_path is not None:
@@ -1210,66 +1217,169 @@ class IdleTrainerApp:
         )
         header.pack(fill="x", pady=(0, 6))
 
-        self.param_vars: Dict[str, tk.StringVar] = {}
+        self.param_controls: Dict[str, Dict[str, object]] = {}
         param_specs = [
-            ("learning_rate", "Lärhastighet", float),
-            ("gamma", "Gamma", float),
-            ("epsilon", "Epsilon", float),
-            ("epsilon_min", "Min epsilon", float),
-            ("epsilon_decay", "Epsilon-förfall", float),
-            ("batch_size", "Batch-storlek", int),
-            ("target_sync_interval", "Synkintervall", int),
+            ("learning_rate", "Lärhastighet", 0.0001, 0.01, 0.0001, float, "{:.4f}"),
+            ("gamma", "Gamma", 0.8, 0.999, 0.001, float, "{:.3f}"),
+            ("epsilon", "Epsilon", 0.0, 1.0, 0.01, float, "{:.2f}"),
+            ("epsilon_min", "Min epsilon", 0.0, 0.5, 0.01, float, "{:.2f}"),
+            ("epsilon_decay", "Epsilon-förfall", 0.8, 0.9999, 0.0001, float, "{:.4f}"),
+            ("batch_size", "Batch-storlek", 8, 512, 8, int, "{:d}"),
+            ("target_sync_interval", "Synkintervall", 100, 5000, 50, int, "{:d}"),
         ]
-        for name, label, value_type in param_specs:
+        for name, label_text, minimum, maximum, resolution, value_type, fmt in param_specs:
             row = tk.Frame(params_container, bg="#101010")
             row.pack(fill="x", pady=2)
             tk.Label(
                 row,
-                text=label,
+                text=label_text,
                 width=18,
                 anchor="w",
                 bg="#101010",
                 fg="#d0d0d0",
                 font=("Segoe UI", 10),
             ).pack(side="left")
-            var = tk.StringVar()
-            entry = tk.Entry(
+            value_label = tk.Label(
                 row,
-                textvariable=var,
-                width=10,
-                justify="right",
-                bg="#1c1c1c",
-                fg="#f5f5f5",
-                insertbackground="#f5f5f5",
+                text="",
+                width=8,
+                anchor="e",
+                bg="#101010",
+                fg="#cddc39",
                 font=("Consolas", 10),
             )
-            entry.pack(side="left", padx=(4, 0))
-            var.trace_add("write", partial(self._on_param_change, name, var, value_type))
-            self.param_vars[name] = var
+            value_label.pack(side="right")
+            var_cls = tk.DoubleVar if value_type is float else tk.IntVar
+            initial_value = getattr(self.agent, name)
+            var = var_cls(value=initial_value)
+            scale = tk.Scale(
+                row,
+                from_=minimum,
+                to=maximum,
+                resolution=resolution,
+                orient="horizontal",
+                variable=var,
+                showvalue=False,
+                length=180,
+                bg="#101010",
+                troughcolor="#1c1c1c",
+                highlightthickness=0,
+                sliderrelief="flat",
+                command=partial(self._on_param_slider_change, name, value_type, fmt, value_label),
+            )
+            scale.pack(side="left", fill="x", expand=True, padx=(8, 0))
+            display_value = initial_value if value_type is float else int(initial_value)
+            value_label.config(text=fmt.format(display_value))
+            self.param_controls[name] = {
+                "var": var,
+                "label": value_label,
+                "format": fmt,
+                "type": value_type,
+                "scale": scale,
+            }
 
-        steps_frame = tk.Frame(params_container, bg="#101010")
-        steps_frame.pack(fill="x", pady=(8, 0))
+        speed_frame = tk.Frame(params_container, bg="#101010")
+        speed_frame.pack(fill="x", pady=(10, 0))
         tk.Label(
-            steps_frame,
-            text="Steg per uppdatering",
+            speed_frame,
+            text="Uppdateringar per sekund",
             anchor="w",
             bg="#101010",
             fg="#d0d0d0",
             font=("Segoe UI", 10),
         ).pack(side="left")
-        self.steps_per_tick_var = tk.IntVar(value=4)
-        steps_spin = tk.Spinbox(
-            steps_frame,
-            from_=1,
-            to=256,
-            textvariable=self.steps_per_tick_var,
-            width=5,
-            justify="right",
-            bg="#1c1c1c",
-            fg="#f5f5f5",
-            insertbackground="#f5f5f5",
+        self.updates_per_second_var = tk.DoubleVar(value=12.0)
+        speed_value_label = tk.Label(
+            speed_frame,
+            text="",
+            width=8,
+            anchor="e",
+            bg="#101010",
+            fg="#90caf9",
+            font=("Consolas", 10),
         )
-        steps_spin.pack(side="left", padx=(8, 0))
+        speed_value_label.pack(side="right")
+        speed_slider = tk.Scale(
+            speed_frame,
+            from_=1,
+            to=240,
+            resolution=1,
+            orient="horizontal",
+            variable=self.updates_per_second_var,
+            showvalue=False,
+            length=180,
+            bg="#101010",
+            troughcolor="#1c1c1c",
+            highlightthickness=0,
+            sliderrelief="flat",
+            command=partial(self._on_speed_change, speed_value_label),
+        )
+        speed_slider.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self._on_speed_change(speed_value_label, str(self.updates_per_second_var.get()))
+
+        reward_container = tk.Frame(sidebar, bg="#101010")
+        reward_container.pack(fill="x", pady=(12, 8))
+        reward_header = tk.Label(
+            reward_container,
+            text="Reward-vikter",
+            font=("Segoe UI", 11, "bold"),
+            anchor="w",
+            bg="#101010",
+            fg="#f5f5f5",
+        )
+        reward_header.pack(fill="x", pady=(0, 6))
+
+        self.reward_controls: Dict[str, Dict[str, object]] = {}
+        for reward_field in fields(RewardConfig):
+            name = reward_field.name
+            row = tk.Frame(reward_container, bg="#101010")
+            row.pack(fill="x", pady=2)
+            label_text = name.replace("_", " ").title()
+            tk.Label(
+                row,
+                text=label_text,
+                width=18,
+                anchor="w",
+                bg="#101010",
+                fg="#d0d0d0",
+                font=("Segoe UI", 10),
+            ).pack(side="left")
+            value_label = tk.Label(
+                row,
+                text="",
+                width=8,
+                anchor="e",
+                bg="#101010",
+                fg="#ffb74d",
+                font=("Consolas", 10),
+            )
+            value_label.pack(side="right")
+            default_value = getattr(self.env.reward_config, name)
+            limit = max(5.0, abs(default_value) * 3.0)
+            var = tk.DoubleVar(value=default_value)
+            scale = tk.Scale(
+                row,
+                from_=-limit,
+                to=limit,
+                resolution=0.01,
+                orient="horizontal",
+                variable=var,
+                showvalue=False,
+                length=180,
+                bg="#101010",
+                troughcolor="#1c1c1c",
+                highlightthickness=0,
+                sliderrelief="flat",
+                command=partial(self._on_reward_change, name, value_label),
+            )
+            scale.pack(side="left", fill="x", expand=True, padx=(8, 0))
+            value_label.config(text=f"{default_value:+.2f}")
+            self.reward_controls[name] = {
+                "var": var,
+                "label": value_label,
+                "scale": scale,
+                "format": "{:+.2f}",
+            }
 
         self.message_var = tk.StringVar()
         message_label = tk.Label(
@@ -1289,21 +1399,23 @@ class IdleTrainerApp:
         button_frame.pack(fill="x", pady=(0, 8))
 
         btn_specs = [
-            ("Starta träning", self.start_training),
-            ("Pausa", self.pause_training),
-            ("Spara modell", self.save_model),
-            ("Ladda modell", self.load_model),
-            ("Återställ statistik", self.reset_stats),
+            ("Starta träning", self.start_training, "#2e7d32"),
+            ("Pausa", self.pause_training, "#455a64"),
+            ("Starta utvärdering", self.start_evaluation, "#1565c0"),
+            ("Stoppa utvärdering", self.stop_evaluation, "#546e7a"),
+            ("Spara modell", self.save_model, "#455a64"),
+            ("Ladda modell", self.load_model, "#455a64"),
+            ("Återställ statistik", self.reset_stats, "#455a64"),
         ]
-        for text, command in btn_specs:
+        for text, command, color in btn_specs:
             button = tk.Button(
                 button_frame,
                 text=text,
                 command=command,
                 width=20,
-                bg="#2e7d32" if "Starta" in text else "#455a64",
+                bg=color,
                 fg="#f5f5f5",
-                activebackground="#1b5e20",
+                activebackground=color,
                 activeforeground="#f5f5f5",
                 relief="flat",
                 pady=6,
@@ -1319,19 +1431,36 @@ class IdleTrainerApp:
         self._update_canvas(self.env.snapshot())
         self._update_stats_label()
 
-    def _training_loop(self) -> None:
+    def _compute_update_schedule(self) -> Tuple[int, int]:
+        try:
+            updates = float(self.updates_per_second_var.get())
+        except (TypeError, tk.TclError):
+            updates = 12.0
+        updates = max(1.0, updates)
+        max_refresh = 60.0
+        if updates <= max_refresh:
+            delay = max(10, int(1000 / updates))
+            steps = 1
+        else:
+            steps = int(math.ceil(updates / max_refresh))
+            delay = max(10, int(1000 / max_refresh))
+        return steps, delay
+
+    def _update_loop(self) -> None:
+        steps, delay = self._compute_update_schedule()
         if self.training_active and self.current_state is not None:
-            try:
-                steps = max(1, int(self.steps_per_tick_var.get()))
-            except (TypeError, ValueError):
-                steps = 1
             for _ in range(steps):
                 if not self.training_active:
                     break
                 self._run_training_step()
+        elif self.evaluation_active and self.current_state is not None:
+            for _ in range(steps):
+                if not self.evaluation_active:
+                    break
+                self._run_evaluation_step()
         self._update_canvas(self.env.snapshot())
         self._update_stats_label()
-        self.root.after(50, self._training_loop)
+        self.root.after(delay, self._update_loop)
 
     def _run_training_step(self) -> None:
         assert self.current_state is not None
@@ -1354,9 +1483,26 @@ class IdleTrainerApp:
         self.current_episode_reward += reward
         self.current_episode_steps = int(info.get("steps", self.current_episode_steps + 1))
         self.last_reward = reward
+        self._last_mode = "training"
 
         if done:
             self.stats.record(self.current_episode_reward, self.env.max_length)
+            self._reset_episode()
+
+    def _run_evaluation_step(self) -> None:
+        assert self.current_state is not None
+        action = self.agent.select_action(self.current_state, greedy=True)
+        next_state, reward, done, info = self.env.step(action)
+
+        self.current_state = next_state
+        self.current_episode_reward += reward
+        self.current_episode_steps = int(info.get("steps", self.current_episode_steps + 1))
+        self.last_reward = reward
+        self._last_mode = "evaluation"
+
+        if done:
+            self.last_evaluation_reward = self.current_episode_reward
+            self.evaluation_episodes += 1
             self._reset_episode()
 
     def _update_canvas(self, snapshot: Dict[str, object]) -> None:
@@ -1407,23 +1553,42 @@ class IdleTrainerApp:
         )
 
     def _update_stats_label(self) -> None:
+        current_length = len(self.env.snake)
+        fruits = self.env.fruits_eaten
+        if self.evaluation_active or self._last_mode == "evaluation":
+            status = "Utvärdering aktiv" if self.evaluation_active else "Utvärdering pausad"
+            self.stats_var.set(
+                (
+                    f"{status} | Episoder: {self.evaluation_episodes} | "
+                    f"Senaste episodreward: {self.last_evaluation_reward:.2f} | "
+                    f"Pågående reward: {self.current_episode_reward:.2f} | Frukter: {fruits} | "
+                    f"Längd: {current_length}"
+                )
+            )
+            self.detail_var.set(
+                (
+                    f"Steg {self.current_episode_steps} | Senaste reward: {self.last_reward:+.2f} | "
+                    f"Max längd: {self.env.max_length} | Total reward: {self.env.total_reward:.2f}"
+                )
+            )
+            return
+
         avg_reward = self.stats.average_reward
         avg_length = self.stats.average_length
         best_length = self.stats.best_length
-        current_length = len(self.env.snake)
         self.stats_var.set(
             (
-                f"Episoder: {self.stats.episodes} | Medelpoäng: {avg_reward:.2f} | "
+                f"Träningsstatistik – Episoder: {self.stats.episodes} | Medelpoäng: {avg_reward:.2f} | "
                 f"Medellängd: {avg_length:.2f} | Längsta längd: {best_length} | "
-                f"Nuvarande längd: {current_length} | Senaste episodpoäng: {self.stats.last_episode_reward:.2f} | "
-                f"Senaste längd: {self.stats.last_episode_length:.2f}"
+                f"Senaste episodpoäng: {self.stats.last_episode_reward:.2f} | Senaste längd: {self.stats.last_episode_length:.2f}"
             )
         )
-        loss_text = f"{self.last_loss:.4f}" if self.last_loss is not None else "…"
+        loss_text = f"{self.last_loss:.4f}" if self.last_loss is not None else "–"
+        mode = "Träning" if self.training_active else "Pausad"
         self.detail_var.set(
             (
-                f"Episod {self.stats.episodes + 1} | Steg {self.current_episode_steps} | "
-                f"Nuvarande längd: {len(self.env.snake)} | Max längd: {self.env.max_length} | "
+                f"Läge: {mode} | Episod {self.stats.episodes + 1} | Steg {self.current_episode_steps} | "
+                f"Frukter: {fruits} | Nuvarande längd: {current_length} | Max längd: {self.env.max_length} | "
                 f"Senaste reward: {self.last_reward:+.2f} | Episodreward: {self.current_episode_reward:.2f} | "
                 f"Förlust: {loss_text} | ε={self.agent.epsilon:.3f}"
             )
@@ -1433,17 +1598,61 @@ class IdleTrainerApp:
         self.message_var.set(message)
 
     def start_training(self) -> None:
+        reset_needed = False
+        if self.evaluation_active:
+            self.evaluation_active = False
+            reset_needed = True
+        elif self._last_mode == "evaluation":
+            reset_needed = True
+        if reset_needed:
+            self._reset_episode()
         if not self.training_active:
             self.training_active = True
+            self._last_mode = "training"
             self._log_message("Träning pågår…")
+        self._update_stats_label()
 
     def pause_training(self) -> None:
+        if self.training_active or self.evaluation_active:
+            was_training = self.training_active
+            was_evaluation = self.evaluation_active
+            self.training_active = False
+            self.evaluation_active = False
+            if was_training:
+                self._last_mode = "training"
+                self._log_message("Träningen pausades.")
+            elif was_evaluation:
+                self._last_mode = "evaluation"
+                self._log_message("Utvärderingen pausades.")
+            self._update_stats_label()
+
+    def start_evaluation(self) -> None:
+        reset_needed = False
         if self.training_active:
             self.training_active = False
-            self._log_message("Träningen pausades.")
+            reset_needed = True
+        if self._last_mode != "evaluation":
+            reset_needed = True
+        if reset_needed:
+            self._reset_episode()
+        if not self.evaluation_active:
+            self.evaluation_active = True
+            self._last_mode = "evaluation"
+            self.last_loss = None
+            self._log_message("Utvärdering pågår…")
+        self._update_stats_label()
+
+    def stop_evaluation(self) -> None:
+        if self.evaluation_active:
+            self.evaluation_active = False
+            self._last_mode = "evaluation"
+            self._log_message("Utvärderingen stoppades.")
+        self._update_stats_label()
 
     def reset_stats(self) -> None:
         self.stats.reset()
+        self.evaluation_episodes = 0
+        self.last_evaluation_reward = 0.0
         self._log_message("Statistiken återställdes.")
         self._update_stats_label()
 
@@ -1490,32 +1699,75 @@ class IdleTrainerApp:
         self._log_message(f"Modellen sparades till {name}.")
 
     def _sync_param_entries_from_agent(self) -> None:
+        if not hasattr(self, "param_controls"):
+            return
         self._syncing_params = True
-        for name, var in self.param_vars.items():
+        for name, control in self.param_controls.items():
             value = getattr(self.agent, name)
-            var.set(self._format_param_value(value))
+            control["var"].set(value)
+            display_value = int(value) if control["type"] is int else float(value)
+            control["label"].config(text=control["format"].format(display_value))
         self._syncing_params = False
 
-    def _format_param_value(self, value: float | int) -> str:
-        if isinstance(value, float):
-            return f"{value:.6g}"
-        return str(int(value))
+    def _sync_reward_sliders_from_env(self) -> None:
+        if not hasattr(self, "reward_controls"):
+            return
+        self._syncing_rewards = True
+        for name, control in self.reward_controls.items():
+            value = getattr(self.env.reward_config, name)
+            control["var"].set(value)
+            control["label"].config(text=control["format"].format(value))
+        self._syncing_rewards = False
 
-    def _on_param_change(self, name: str, var: tk.StringVar, value_type: type, *_: object) -> None:
+    def _on_param_slider_change(
+        self,
+        name: str,
+        value_type: type,
+        fmt: str,
+        value_label: tk.Label,
+        value: str,
+    ) -> None:
         if self._syncing_params:
             return
-        text = var.get().strip()
-        if not text:
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return
+        control = self.param_controls[name]
+        if value_type is int:
+            numeric_value = int(round(numeric_value))
+            self._syncing_params = True
+            try:
+                control["var"].set(numeric_value)
+            finally:
+                self._syncing_params = False
+        setattr(self.agent, name, value_type(numeric_value) if value_type is float else numeric_value)
+        display_value = numeric_value if value_type is float else int(numeric_value)
+        value_label.config(text=fmt.format(display_value))
+
+    def _on_speed_change(self, label: tk.Label, value: str) -> None:
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            numeric_value = float(self.updates_per_second_var.get() or 0)
+        numeric_value = max(1.0, numeric_value)
+        label.config(text=f"{numeric_value:.0f}/s" if numeric_value >= 10 else f"{numeric_value:.1f}/s")
+
+    def _on_reward_change(self, name: str, value_label: tk.Label, value: str) -> None:
+        if self._syncing_rewards:
             return
         try:
-            value = value_type(text)
-        except ValueError:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
             return
-        if isinstance(value, float) and not math.isfinite(value):
-            return
-        if value_type is int:
-            value = max(1, int(value))
-        setattr(self.agent, name, value)
+        control = self.reward_controls[name]
+        self._syncing_rewards = True
+        try:
+            control["var"].set(numeric_value)
+        finally:
+            self._syncing_rewards = False
+        setattr(self.env.reward_config, name, float(numeric_value))
+        value_label.config(text=control["format"].format(numeric_value))
 
     def _on_close(self) -> None:
         self.training_active = False
