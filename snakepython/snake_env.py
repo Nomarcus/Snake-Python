@@ -233,8 +233,7 @@ class SnakeEnv(Env):
 
         cell_size = 28
         margin = 20
-        width = self.grid_size * cell_size + margin * 2
-        height = self.grid_size * cell_size + margin * 2
+        board_pixels = self.grid_size * cell_size
         screen = self.surface
         screen.fill((15, 15, 30))
 
@@ -278,6 +277,8 @@ class SnakeEnv(Env):
         )
         pygame.display.set_caption(status)
 
+        self._render_info_panel(screen, margin, board_pixels)
+
         if self.font:
             text_surf = self.font.render(status, True, (220, 220, 220))
             screen.blit(text_surf, (margin, 4))
@@ -303,7 +304,11 @@ class SnakeEnv(Env):
         if not pygame.get_init():
             pygame.init()
         self.clock = pygame.time.Clock()
-        window_size = (self.grid_size * 28 + 40, self.grid_size * 28 + 40)
+        board_pixels = self.grid_size * 28
+        window_size = (
+            board_pixels + 40 + self.info_panel_width,
+            board_pixels + 40,
+        )
         self.surface = pygame.display.set_mode(window_size)
         try:
             pygame.font.init()
