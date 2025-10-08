@@ -5,12 +5,12 @@ from __future__ import annotations
 import argparse
 import math
 import random
-import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from pathlib import Path
+import sys
 from typing import Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 try:  # NumPy krävs för Double DQN-implementationen
@@ -23,6 +23,12 @@ except ModuleNotFoundError as exc:  # pragma: no cover - tydligare fel i IDLE
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+if __package__ in (None, ""):
+    project_root = Path(__file__).resolve().parent.parent
+    project_root_str = str(project_root)
+    if project_root_str not in sys.path:
+        sys.path.insert(0, project_root_str)
 
 from snakepython.utils.reward_telemetry import RewardTelemetryTracker
 
