@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pygame
@@ -58,6 +58,14 @@ class SnakeEnv(Env):
     ACTION_NAMES = {0: "UP", 1: "RIGHT", 2: "DOWN", 3: "LEFT"}
 
     START_PATTERNS: Sequence[str] = ("line", "cube", "spiral", "random")
+    REWARD_COMPONENTS: Tuple[str, ...] = (
+        "fruit_reward",
+        "step_penalty",
+        "death_penalty",
+        "loop_penalty",
+        "compact_bonus",
+        "wall_penalty",
+    )
 
     def __init__(
         self,
@@ -95,6 +103,14 @@ class SnakeEnv(Env):
         self.fruits_eaten: int = 0
         self.loop_history: Deque[Action] = deque(maxlen=12)
         self.episode_reward: float = 0.0
+        self._reward_component_keys: Tuple[str, ...] = self.REWARD_COMPONENTS
+        self.reward_breakdown: Dict[str, float] = {
+            key: 0.0 for key in self._reward_component_keys
+        }
+        self.last_reward_components: Dict[str, float] = {
+            key: 0.0 for key in self._reward_component_keys
+        }
+        self.info_panel_width: int = 240
 
         self._init_pygame_if_needed()
 
@@ -124,6 +140,9 @@ class SnakeEnv(Env):
         self.loop_history.clear()
         self.pending_growth = 0
         self.episode_reward = 0.0
+        for key in self._reward_component_keys:
+            self.reward_breakdown[key] = 0.0
+            self.last_reward_components[key] = 0.0
         self._spawn_snake(options or {})
         self._spawn_fruit()
         observation = self._get_observation()
@@ -135,9 +154,13 @@ class SnakeEnv(Env):
 
     def step(self, action: Action):
         assert self.action_space.contains(action)
-        reward = self.reward_cfg.step_penalty
+        reward = 0.0
         terminated = False
         truncated = False
+        components = {key: 0.0 for key in self._reward_component_keys}
+
+        components["step_penalty"] += self.reward_cfg.step_penalty
+        reward += self.reward_cfg.step_penalty
 
         if self._is_opposite_direction(action):
             action = self.direction
@@ -150,11 +173,14 @@ class SnakeEnv(Env):
 
         # Wall detection – grant penalty and end episode just like HTML.
         if not self._within_bounds(new_head):
+            components["wall_penalty"] += self.reward_cfg.wall_penalty
+            components["death_penalty"] += self.reward_cfg.death_penalty
             reward += self.reward_cfg.wall_penalty
             reward += self.reward_cfg.death_penalty
             terminated = True
         else:
             if new_head in self.snake:
+                components["death_penalty"] += self.reward_cfg.death_penalty
                 reward += self.reward_cfg.death_penalty
                 terminated = True
             else:
@@ -162,6 +188,7 @@ class SnakeEnv(Env):
                 if new_head == self.fruit:
                     self.pending_growth += 1
                     self.fruits_eaten += 1
+                    components["fruit_reward"] += self.reward_cfg.fruit_reward
                     reward += self.reward_cfg.fruit_reward
                     self._spawn_fruit()
                 if self.pending_growth > 0:
@@ -172,14 +199,20 @@ class SnakeEnv(Env):
         self.steps_since_reset += 1
 
         if terminated:
+            self._accumulate_reward_components(components)
             self.episode_reward += reward
             observation = self._get_observation()
             info = self._build_info(done=True)
             return observation, reward, terminated, truncated, info
 
-        reward += self._loop_penalty()
-        reward += self._compactness_bonus()
+        loop_penalty = self._loop_penalty()
+        compact_bonus = self._compactness_bonus()
+        components["loop_penalty"] += loop_penalty
+        components["compact_bonus"] += compact_bonus
+        reward += loop_penalty
+        reward += compact_bonus
 
+        self._accumulate_reward_components(components)
         self.episode_reward += reward
         observation = self._get_observation()
         info = self._build_info(done=False)
@@ -201,8 +234,7 @@ class SnakeEnv(Env):
 
         cell_size = 28
         margin = 20
-        width = self.grid_size * cell_size + margin * 2
-        height = self.grid_size * cell_size + margin * 2
+        board_pixels = self.grid_size * cell_size
         screen = self.surface
         screen.fill((15, 15, 30))
 
@@ -246,6 +278,8 @@ class SnakeEnv(Env):
         )
         pygame.display.set_caption(status)
 
+        self._render_info_panel(screen, margin, board_pixels)
+
         if self.font:
             text_surf = self.font.render(status, True, (220, 220, 220))
             screen.blit(text_surf, (margin, 4))
@@ -271,7 +305,11 @@ class SnakeEnv(Env):
         if not pygame.get_init():
             pygame.init()
         self.clock = pygame.time.Clock()
-        window_size = (self.grid_size * 28 + 40, self.grid_size * 28 + 40)
+        board_pixels = self.grid_size * 28
+        window_size = (
+            board_pixels + 40 + self.info_panel_width,
+            board_pixels + 40,
+        )
         self.surface = pygame.display.set_mode(window_size)
         try:
             pygame.font.init()
@@ -411,13 +449,87 @@ class SnakeEnv(Env):
             "fruits": self.fruits_eaten,
             "steps": self.steps_since_reset,
             "pattern": self.start_pattern,
+            "step_reward_components": dict(self.last_reward_components),
         }
         if done:
+            info["reward_breakdown"] = dict(self.reward_breakdown)
             info["episode"] = {
                 "r": float(self.episode_reward),
                 "l": self.steps_since_reset,
             }
         return info
+
+    def _render_info_panel(
+        self, screen: pygame.Surface, margin: int, board_pixels: int
+    ) -> None:
+        panel_x = margin + board_pixels
+        panel_rect = pygame.Rect(
+            panel_x,
+            margin,
+            self.info_panel_width,
+            board_pixels,
+        )
+        pygame.draw.rect(screen, (24, 24, 46), panel_rect)
+        pygame.draw.rect(screen, (50, 50, 80), panel_rect, 1)
+
+        if not self.font:
+            return
+
+        lines = self._build_panel_lines()
+        line_height = self.font.get_linesize()
+        text_x = panel_x + 12
+        text_y = margin + 12
+        accent_colour = (180, 190, 230)
+        text_colour = (210, 215, 235)
+
+        for line in lines:
+            if line == "":
+                text_y += line_height // 2
+                continue
+            if line.endswith(":"):
+                colour = accent_colour
+            else:
+                colour = text_colour
+            text_surface = self.font.render(line, True, colour)
+            screen.blit(text_surface, (text_x, text_y))
+            text_y += line_height
+
+    def _build_panel_lines(self) -> List[str]:
+        episode_lines = [
+            f"Total reward: {self.episode_reward:+.2f}",
+            f"Fruits eaten: {self.fruits_eaten}",
+            f"Steps taken: {self.steps_since_reset}",
+        ]
+
+        last_components = ["Last step:"]
+        for key in self._reward_component_keys:
+            value = self.last_reward_components.get(key, 0.0)
+            last_components.append(f"{self._format_component_label(key)}: {value:+.2f}")
+
+        cumulative_components = ["Episode sum:"]
+        for key in self._reward_component_keys:
+            value = self.reward_breakdown.get(key, 0.0)
+            cumulative_components.append(
+                f"{self._format_component_label(key)}: {value:+.2f}"
+            )
+
+        return [
+            "Episode stats:",
+            *episode_lines,
+            "",
+            *last_components,
+            "",
+            *cumulative_components,
+        ]
+
+    @staticmethod
+    def _format_component_label(component: str) -> str:
+        return component.replace("_", " ").title()
+
+    def _accumulate_reward_components(self, components: Dict[str, float]) -> None:
+        for key, value in components.items():
+            self.reward_breakdown[key] += value
+            self.last_reward_components[key] = value
 
 
 __all__ = ["SnakeEnv", "RewardConfig"]
