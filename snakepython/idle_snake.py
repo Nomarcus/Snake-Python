@@ -1126,7 +1126,7 @@ class IdleTrainerApp:
         self.root = tk.Tk()
         self.root.title("Snake-ML – Träningskontroll")
         self.root.configure(bg="#101010")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
@@ -1137,6 +1137,17 @@ class IdleTrainerApp:
             self._log_message(self._pending_message)
         else:
             self._log_message("Klar att starta träning.")
+        self.root.update_idletasks()
+        pixel_size = GRID_SIZE * CELL_SIZE
+        min_width = pixel_size + 420
+        min_height = pixel_size + 160
+        requested_width = self.root.winfo_width()
+        requested_height = self.root.winfo_height()
+        target_width = max(requested_width, pixel_size + 640)
+        target_height = max(requested_height, pixel_size + 220)
+        self.root.geometry(f"{target_width}x{target_height}")
+        self.root.minsize(min_width, min_height)
+
         _, initial_delay = self._compute_update_schedule()
         self.root.after(initial_delay, self._update_loop)
 
@@ -1162,6 +1173,9 @@ class IdleTrainerApp:
     def _build_ui(self) -> None:
         main = tk.Frame(self.root, bg="#101010")
         main.pack(fill="both", expand=True, padx=16, pady=16)
+        main.grid_columnconfigure(0, weight=0)
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_rowconfigure(0, weight=1)
 
         pixel_size = GRID_SIZE * CELL_SIZE
         self.canvas = tk.Canvas(
@@ -1171,17 +1185,18 @@ class IdleTrainerApp:
             bg="#151515",
             highlightthickness=0,
         )
-        self.canvas.grid(row=0, column=0, rowspan=4, sticky="nsew")
+        self.canvas.grid(row=0, column=0, sticky="nw")
 
         sidebar = tk.Frame(main, bg="#101010")
-        sidebar.grid(row=0, column=1, sticky="nw", padx=(16, 0))
+        sidebar.grid(row=0, column=1, sticky="nsew", padx=(16, 0))
+        sidebar.grid_columnconfigure(0, weight=1)
 
         self.stats_var = tk.StringVar()
         stats_label = tk.Label(
             sidebar,
             textvariable=self.stats_var,
             justify="left",
-            wraplength=320,
+            wraplength=360,
             anchor="w",
             font=("Segoe UI", 11),
             bg="#101010",
@@ -1194,7 +1209,7 @@ class IdleTrainerApp:
             sidebar,
             textvariable=self.detail_var,
             justify="left",
-            wraplength=320,
+            wraplength=360,
             anchor="w",
             font=("Segoe UI", 10),
             bg="#101010",
@@ -1204,8 +1219,14 @@ class IdleTrainerApp:
 
         self._create_buttons(sidebar)
 
-        params_container = tk.Frame(sidebar, bg="#101010")
-        params_container.pack(fill="x", pady=(12, 8))
+        tuning_frame = tk.Frame(sidebar, bg="#101010")
+        tuning_frame.pack(fill="both", expand=True, pady=(12, 8))
+        tuning_frame.grid_columnconfigure(0, weight=1)
+        tuning_frame.grid_columnconfigure(1, weight=1)
+        tuning_frame.grid_rowconfigure(0, weight=1)
+
+        params_container = tk.Frame(tuning_frame, bg="#101010")
+        params_container.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
         header = tk.Label(
             params_container,
@@ -1260,7 +1281,7 @@ class IdleTrainerApp:
                 orient="horizontal",
                 variable=var,
                 showvalue=False,
-                length=180,
+                length=220,
                 bg="#101010",
                 troughcolor="#1c1c1c",
                 highlightthickness=0,
@@ -1307,7 +1328,7 @@ class IdleTrainerApp:
             orient="horizontal",
             variable=self.updates_per_second_var,
             showvalue=False,
-            length=180,
+            length=220,
             bg="#101010",
             troughcolor="#1c1c1c",
             highlightthickness=0,
@@ -1317,8 +1338,8 @@ class IdleTrainerApp:
         speed_slider.pack(side="left", fill="x", expand=True, padx=(8, 0))
         self._on_speed_change(speed_value_label, str(self.updates_per_second_var.get()))
 
-        reward_container = tk.Frame(sidebar, bg="#101010")
-        reward_container.pack(fill="x", pady=(12, 8))
+        reward_container = tk.Frame(tuning_frame, bg="#101010")
+        reward_container.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
         reward_header = tk.Label(
             reward_container,
             text="Reward-vikter",
@@ -1365,7 +1386,7 @@ class IdleTrainerApp:
                 orient="horizontal",
                 variable=var,
                 showvalue=False,
-                length=180,
+                length=220,
                 bg="#101010",
                 troughcolor="#1c1c1c",
                 highlightthickness=0,
@@ -1386,13 +1407,21 @@ class IdleTrainerApp:
             sidebar,
             textvariable=self.message_var,
             justify="left",
-            wraplength=320,
+            wraplength=360,
             anchor="w",
             font=("Segoe UI", 10),
             bg="#101010",
             fg="#90caf9",
         )
         message_label.pack(fill="x", pady=(8, 0))
+
+        def _update_wraplength(event: tk.Event) -> None:
+            wrap = max(event.width - 24, 240)
+            stats_label.config(wraplength=wrap)
+            detail_label.config(wraplength=wrap)
+            message_label.config(wraplength=wrap)
+
+        sidebar.bind("<Configure>", _update_wraplength)
 
     def _create_buttons(self, parent: tk.Misc) -> None:
         button_frame = tk.Frame(parent, bg="#101010")
