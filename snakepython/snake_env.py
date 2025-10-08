@@ -110,7 +110,6 @@ class SnakeEnv(Env):
         self.last_reward_components: Dict[str, float] = {
             key: 0.0 for key in self._reward_component_keys
         }
-        self.info_panel_width: int = 240
 
         self._init_pygame_if_needed()
 
@@ -458,73 +457,6 @@ class SnakeEnv(Env):
                 "l": self.steps_since_reset,
             }
         return info
-
-    def _render_info_panel(
-        self, screen: pygame.Surface, margin: int, board_pixels: int
-    ) -> None:
-        panel_x = margin + board_pixels
-        panel_rect = pygame.Rect(
-            panel_x,
-            margin,
-            self.info_panel_width,
-            board_pixels,
-        )
-        pygame.draw.rect(screen, (24, 24, 46), panel_rect)
-        pygame.draw.rect(screen, (50, 50, 80), panel_rect, 1)
-
-        if not self.font:
-            return
-
-        lines = self._build_panel_lines()
-        line_height = self.font.get_linesize()
-        text_x = panel_x + 12
-        text_y = margin + 12
-        accent_colour = (180, 190, 230)
-        text_colour = (210, 215, 235)
-
-        for line in lines:
-            if line == "":
-                text_y += line_height // 2
-                continue
-            if line.endswith(":"):
-                colour = accent_colour
-            else:
-                colour = text_colour
-            text_surface = self.font.render(line, True, colour)
-            screen.blit(text_surface, (text_x, text_y))
-            text_y += line_height
-
-    def _build_panel_lines(self) -> List[str]:
-        episode_lines = [
-            f"Total reward: {self.episode_reward:+.2f}",
-            f"Fruits eaten: {self.fruits_eaten}",
-            f"Steps taken: {self.steps_since_reset}",
-        ]
-
-        last_components = ["Last step:"]
-        for key in self._reward_component_keys:
-            value = self.last_reward_components.get(key, 0.0)
-            last_components.append(f"{self._format_component_label(key)}: {value:+.2f}")
-
-        cumulative_components = ["Episode sum:"]
-        for key in self._reward_component_keys:
-            value = self.reward_breakdown.get(key, 0.0)
-            cumulative_components.append(
-                f"{self._format_component_label(key)}: {value:+.2f}"
-            )
-
-        return [
-            "Episode stats:",
-            *episode_lines,
-            "",
-            *last_components,
-            "",
-            *cumulative_components,
-        ]
-
-    @staticmethod
-    def _format_component_label(component: str) -> str:
-        return component.replace("_", " ").title()
 
     def _accumulate_reward_components(self, components: Dict[str, float]) -> None:
         for key, value in components.items():

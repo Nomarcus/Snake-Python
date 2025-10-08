@@ -52,6 +52,13 @@ python idle_snake.py --load-model idle_dqn.npz --play --autopilot
 Terminalen skriver ut träningsstatistik var tionde episod och autopilot kan
 slås av/på i spelet genom att trycka på `A`.
 
+Vill du hellre använda det grafiska träningsgränssnittet från IDLE kan du
+starta det direkt:
+
+```bash
+python idle_snake.py --trainer-ui
+```
+
 ## Manuella installationssteg
 
 Föredrar du att göra allt manuellt kan du följa dessa steg:
