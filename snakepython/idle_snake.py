@@ -2242,6 +2242,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--play", action="store_true", help="Starta Tkinter-spelet")
     parser.add_argument("--autopilot", action="store_true", help="Aktivera autopilot när spelet startas")
     parser.add_argument(
+        "--trainer-ui",
+        action="store_true",
+        help="Starta träningsgränssnittet i stället för spelet vid standardkörning",
+    )
+    parser.add_argument(
         "--visualize-training",
         action="store_true",
         help="Visa träningsmiljön live i ett Tkinter-fönster",
@@ -2280,7 +2285,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             f"Bäst: {best:.2f} | Sämst: {worst:.2f}"
         )
 
-    if args.play or (args.autopilot and agent is not None):
+    default_run = args.train == 0 and args.evaluate == 0 and not args.play and not args.trainer_ui
+    should_play = args.play or args.autopilot or default_run
+
+    if should_play:
         try:
             start_game(agent=agent, autopilot=args.autopilot)
         except tk.TclError as exc:  # pragma: no cover - headless safeguard
@@ -2290,8 +2298,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 file=sys.stderr,
             )
             raise SystemExit(1) from exc
-    elif args.train == 0 and args.evaluate == 0:
-        # Default behaviour when running without flaggar: visa den nya träningskontrollen.
+    elif args.trainer_ui:
+        # Starta träningskontrollen när --trainer-ui används.
         try:
             start_idle_trainer_ui(load_path=args.load_model if agent is None else None)
         except tk.TclError as exc:  # pragma: no cover - headless safeguard
