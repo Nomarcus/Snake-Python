@@ -30,7 +30,10 @@ if __package__ in (None, ""):
     if project_root_str not in sys.path:
         sys.path.insert(0, project_root_str)
 
-from snakepython.utils.reward_telemetry import RewardTelemetryTracker
+from snakepython.utils.reward_telemetry import (
+    RewardTelemetryTracker,
+    compute_component_shares,
+)
 
 # ---------------------------------------------------------------------------
 # Game configuration
@@ -796,20 +799,44 @@ class RewardTelemetryPanel(tk.Frame):
         trimmed_step = {component: float(step_breakdown.get(component, 0.0)) for component in self.components}
         trimmed_totals = {component: float(episode_breakdown.get(component, 0.0)) for component in self.components}
         self.tracker.update(trimmed_step)
-        self._render_last(trimmed_step)
-        self._render_totals(trimmed_totals)
+        step_shares = compute_component_shares(self.components, trimmed_step)
+        total_shares = compute_component_shares(self.components, trimmed_totals)
+        self._render_last(trimmed_step, step_shares)
+        self._render_totals(trimmed_totals, total_shares)
         self._render_trends()
 
-    def _render_last(self, breakdown: Mapping[str, float]) -> None:
+    def _render_last(
+        self,
+        breakdown: Mapping[str, float],
+        shares: Optional[Mapping[str, Optional[float]]] = None,
+    ) -> None:
         lines = ["Senaste steg:"]
         for component in self.components:
-            lines.append(self._format_component_line(component, breakdown.get(component, 0.0)))
+            share = shares.get(component) if shares else None
+            lines.append(
+                self._format_component_line(
+                    component,
+                    breakdown.get(component, 0.0),
+                    share,
+                )
+            )
         self.last_label.configure(text="\n".join(lines))
 
-    def _render_totals(self, totals: Mapping[str, float]) -> None:
+    def _render_totals(
+        self,
+        totals: Mapping[str, float],
+        shares: Optional[Mapping[str, Optional[float]]] = None,
+    ) -> None:
         lines = ["Ackumulerat:"]
         for component in self.components:
-            lines.append(self._format_component_line(component, totals.get(component, 0.0)))
+            share = shares.get(component) if shares else None
+            lines.append(
+                self._format_component_line(
+                    component,
+                    totals.get(component, 0.0),
+                    share,
+                )
+            )
         self.total_label.configure(text="\n".join(lines))
 
     def _render_trends(self) -> None:
@@ -826,14 +853,20 @@ class RewardTelemetryPanel(tk.Frame):
                 f"{self._format_value(comp_stats.get('avg_1000')):>10}"
                 f"{self._format_value(comp_stats.get('std')):>9}"
             )
-            lines.append(line)
+            lines.append(line + self._format_share_text(comp_stats.get("share_total")))
         self.trend_label.configure(text="\n".join(lines))
 
     def _label(self, component: str) -> str:
         return COMPONENT_LABELS.get(component, component.replace("_", " ").title())
 
-    def _format_component_line(self, component: str, value: float) -> str:
-        return f"{self._label(component):<18}{self._format_signed(value):>9}"
+    def _format_component_line(
+        self,
+        component: str,
+        value: float,
+        share: Optional[float] = None,
+    ) -> str:
+        base = f"{self._label(component):<18}{self._format_signed(value):>9}"
+        return base + self._format_share_text(share)
 
     @staticmethod
     def _format_signed(value: float) -> str:
@@ -846,6 +879,12 @@ class RewardTelemetryPanel(tk.Frame):
         if value is None or (isinstance(value, float) and math.isnan(value)):
             return "    -"
         return f"{value:7.2f}"
+
+    @staticmethod
+    def _format_share_text(share: Optional[float]) -> str:
+        if share is None:
+            return ""
+        return f" ({share:5.1f}%)"
 
 
 class SnakeCanvas(tk.Canvas):
