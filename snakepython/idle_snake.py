@@ -8,7 +8,7 @@ import random
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from pathlib import Path
 from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple
@@ -1106,6 +1106,7 @@ class IdleTrainerApp:
 
     def __init__(self, *, load_path: Optional[Path | str] = None) -> None:
         self.env = IdleSnakeEnv()
+        initial_state = self.env.reset()
         self.stats = TrainingStats()
         self.training_active = False
         self.evaluation_active = False
@@ -1120,6 +1121,13 @@ class IdleTrainerApp:
         self._syncing_rewards = False
         self._pending_message: Optional[str] = None
         self._last_mode: str = "idle"
+
+        self.training_envs: List[IdleSnakeEnv] = [self.env]
+        self.env_states: List[np.ndarray] = [initial_state.copy()]
+        self.env_episode_rewards: List[float] = [0.0]
+        self.env_episode_steps: List[int] = [0]
+        self.max_parallel_envs = 16
+        self._syncing_env_count = False
 
         self.agent = self._load_initial_agent(load_path)
 
@@ -1239,6 +1247,37 @@ class IdleTrainerApp:
         header.pack(fill="x", pady=(0, 6))
 
         self.param_controls: Dict[str, Dict[str, object]] = {}
+
+        env_row = tk.Frame(params_container, bg="#101010")
+        env_row.pack(fill="x", pady=2)
+        tk.Label(
+            env_row,
+            text="Antal miljöer",
+            width=18,
+            anchor="w",
+            bg="#101010",
+            fg="#d0d0d0",
+            font=("Segoe UI", 10),
+        ).pack(side="left")
+        self.parallel_envs_var = tk.IntVar(value=len(self.training_envs))
+        env_spinbox = tk.Spinbox(
+            env_row,
+            from_=1,
+            to=self.max_parallel_envs,
+            textvariable=self.parallel_envs_var,
+            width=6,
+            justify="right",
+            bg="#101010",
+            fg="#90caf9",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#1c1c1c",
+            highlightcolor="#90caf9",
+            insertbackground="#90caf9",
+        )
+        env_spinbox.pack(side="right")
+        self.parallel_envs_var.trace_add("write", self._on_parallel_envs_var_changed)
+
         param_specs = [
             ("learning_rate", "Lärhastighet", 0.0001, 0.01, 0.0001, float, "{:.4f}"),
             ("gamma", "Gamma", 0.8, 0.999, 0.001, float, "{:.3f}"),
@@ -1452,13 +1491,66 @@ class IdleTrainerApp:
             )
             button.pack(fill="x", pady=3)
 
+    def _reset_env(self, index: int, *, update_canvas: bool = True) -> None:
+        env = self.training_envs[index]
+        state = env.reset()
+        if index >= len(self.env_states):
+            self.env_states.append(state.copy())
+            self.env_episode_rewards.append(0.0)
+            self.env_episode_steps.append(0)
+        else:
+            self.env_states[index] = state.copy()
+            self.env_episode_rewards[index] = 0.0
+            self.env_episode_steps[index] = 0
+        if index == 0:
+            self.current_state = state.copy()
+            self.current_episode_reward = 0.0
+            self.current_episode_steps = 0
+            self.last_reward = 0.0
+            if update_canvas and hasattr(self, "canvas"):
+                self._update_canvas(env.snapshot())
+
+    def _set_parallel_envs(self, count: int) -> None:
+        count = max(1, min(self.max_parallel_envs, count))
+        current = len(self.training_envs)
+        if count == current:
+            return
+        if count < current:
+            self.training_envs = self.training_envs[:count]
+            self.env_states = self.env_states[:count]
+            self.env_episode_rewards = self.env_episode_rewards[:count]
+            self.env_episode_steps = self.env_episode_steps[:count]
+        else:
+            for _ in range(count - current):
+                new_env = IdleSnakeEnv(
+                    grid_size=self.env.grid_size,
+                    reward_config=replace(self.env.reward_config),
+                )
+                state = new_env.reset()
+                self.training_envs.append(new_env)
+                self.env_states.append(state.copy())
+                self.env_episode_rewards.append(0.0)
+                self.env_episode_steps.append(0)
+        self.env = self.training_envs[0]
+        if self.current_state is not None:
+            self.env_states[0] = self.current_state.copy()
+            self.env_episode_rewards[0] = self.current_episode_reward
+            self.env_episode_steps[0] = self.current_episode_steps
+        else:
+            self._reset_env(0, update_canvas=False)
+        self._update_additional_env_reward_configs()
+
     def _reset_episode(self) -> None:
-        self.current_state = self.env.reset()
-        self.current_episode_reward = 0.0
-        self.current_episode_steps = 0
-        self.last_reward = 0.0
-        self._update_canvas(self.env.snapshot())
+        self._reset_env(0)
         self._update_stats_label()
+
+    def _update_additional_env_reward_configs(self) -> None:
+        if len(self.training_envs) <= 1:
+            return
+        source = self.env.reward_config
+        for other_env in self.training_envs[1:]:
+            for reward_field in fields(RewardConfig):
+                setattr(other_env.reward_config, reward_field.name, getattr(source, reward_field.name))
 
     def _compute_update_schedule(self) -> Tuple[int, int]:
         try:
@@ -1492,31 +1584,39 @@ class IdleTrainerApp:
         self.root.after(delay, self._update_loop)
 
     def _run_training_step(self) -> None:
-        assert self.current_state is not None
-        action = self.agent.select_action(self.current_state)
-        next_state, reward, done, info = self.env.step(action)
-        transition = Transition(
-            state=self.current_state.copy(),
-            action=action,
-            reward=reward,
-            next_state=next_state.copy(),
-            done=done,
-        )
-        self.agent.push(transition)
-        loss = self.agent.learn()
-        if loss is not None:
-            self.last_loss = loss
-        self.agent.decay_epsilon()
+        for index, env in enumerate(self.training_envs):
+            state = self.env_states[index]
+            action = self.agent.select_action(state)
+            next_state, reward, done, info = env.step(action)
+            transition = Transition(
+                state=state.copy(),
+                action=action,
+                reward=reward,
+                next_state=next_state.copy(),
+                done=done,
+            )
+            self.agent.push(transition)
+            loss = self.agent.learn()
+            if loss is not None:
+                self.last_loss = loss
+            self.agent.decay_epsilon()
 
-        self.current_state = next_state
-        self.current_episode_reward += reward
-        self.current_episode_steps = int(info.get("steps", self.current_episode_steps + 1))
-        self.last_reward = reward
-        self._last_mode = "training"
+            self.env_states[index] = next_state.copy()
+            self.env_episode_rewards[index] += reward
+            steps = int(info.get("steps", self.env_episode_steps[index] + 1))
+            self.env_episode_steps[index] = steps
 
-        if done:
-            self.stats.record(self.current_episode_reward, self.env.max_length)
-            self._reset_episode()
+            if index == 0:
+                self.current_state = next_state.copy()
+                self.current_episode_reward = self.env_episode_rewards[0]
+                self.current_episode_steps = steps
+                self.last_reward = reward
+                self._last_mode = "training"
+
+            if done:
+                total_reward = self.env_episode_rewards[index]
+                self.stats.record(total_reward, env.max_length)
+                self._reset_env(index, update_canvas=index == 0)
 
     def _run_evaluation_step(self) -> None:
         assert self.current_state is not None
@@ -1597,7 +1697,8 @@ class IdleTrainerApp:
             self.detail_var.set(
                 (
                     f"Steg {self.current_episode_steps} | Senaste reward: {self.last_reward:+.2f} | "
-                    f"Max längd: {self.env.max_length} | Total reward: {self.env.total_reward:.2f}"
+                    f"Max längd: {self.env.max_length} | Total reward: {self.env.total_reward:.2f} | "
+                    f"Miljöer: {len(self.training_envs)}"
                 )
             )
             return
@@ -1616,7 +1717,8 @@ class IdleTrainerApp:
         mode = "Träning" if self.training_active else "Pausad"
         self.detail_var.set(
             (
-                f"Läge: {mode} | Episod {self.stats.episodes + 1} | Steg {self.current_episode_steps} | "
+                f"Läge: {mode} | Miljöer: {len(self.training_envs)} | Episod {self.stats.episodes + 1} | "
+                f"Steg {self.current_episode_steps} | "
                 f"Frukter: {fruits} | Nuvarande längd: {current_length} | Max längd: {self.env.max_length} | "
                 f"Senaste reward: {self.last_reward:+.2f} | Episodreward: {self.current_episode_reward:.2f} | "
                 f"Förlust: {loss_text} | ε={self.agent.epsilon:.3f}"
@@ -1635,6 +1737,8 @@ class IdleTrainerApp:
             reset_needed = True
         if reset_needed:
             self._reset_episode()
+            for idx in range(1, len(self.training_envs)):
+                self._reset_env(idx, update_canvas=False)
         if not self.training_active:
             self.training_active = True
             self._last_mode = "training"
@@ -1707,6 +1811,8 @@ class IdleTrainerApp:
         self.agent = agent
         self._sync_param_entries_from_agent()
         self._reset_episode()
+        for idx in range(1, len(self.training_envs)):
+            self._reset_env(idx, update_canvas=False)
         name = Path(path).name
         self._log_message(f"Laddade modell från {name}.")
 
@@ -1747,6 +1853,41 @@ class IdleTrainerApp:
             control["var"].set(value)
             control["label"].config(text=control["format"].format(value))
         self._syncing_rewards = False
+        self._update_additional_env_reward_configs()
+
+    def _on_parallel_envs_var_changed(self, *_: object) -> None:
+        if self._syncing_env_count:
+            return
+        try:
+            requested = int(self.parallel_envs_var.get())
+        except (tk.TclError, ValueError):
+            return
+        self._apply_parallel_env_count(requested)
+
+    def _apply_parallel_env_count(self, requested: int) -> None:
+        requested = max(1, min(self.max_parallel_envs, requested))
+        current = len(self.training_envs)
+        if requested == current:
+            return
+        if self.training_active or self.evaluation_active:
+            self._syncing_env_count = True
+            try:
+                self.parallel_envs_var.set(current)
+            finally:
+                self._syncing_env_count = False
+            if self.training_active:
+                self._log_message("Pausa träningen innan du ändrar antal miljöer.")
+            else:
+                self._log_message("Stoppa utvärderingen innan du ändrar antal miljöer.")
+            return
+        self._set_parallel_envs(requested)
+        self._syncing_env_count = True
+        try:
+            self.parallel_envs_var.set(len(self.training_envs))
+        finally:
+            self._syncing_env_count = False
+        self._log_message(f"Antal träningsmiljöer satt till {len(self.training_envs)}.")
+        self._update_stats_label()
 
     def _on_param_slider_change(
         self,
@@ -1796,6 +1937,7 @@ class IdleTrainerApp:
         finally:
             self._syncing_rewards = False
         setattr(self.env.reward_config, name, float(numeric_value))
+        self._update_additional_env_reward_configs()
         value_label.config(text=control["format"].format(numeric_value))
 
     def _on_close(self) -> None:
